@@ -174,9 +174,14 @@ header{
   padding:24px 20px 20px;
 }
 header h1{
-  margin:0 0 14px;
+  margin:0 0 4px;
   font-size:1.4rem;
   font-weight:700;
+}
+.brand{
+  color:var(--accent);
+  font-size:0.85rem;
+  margin:0 0 14px;
 }
 #searchBox{
   width:100%;
@@ -314,11 +319,12 @@ footer{
 <body>
 <header>
   <h1>2025년 귀속 업종코드 검색</h1>
+  <div class="brand">더나은세무법인 덕수 · 김태현 세무사</div>
   <input id="searchBox" type="text" placeholder="키워드 또는 업종코드 입력 — 예: 임가공, 무상사급, 921505" autocomplete="off">
 </header>
 <div id="meta"><span id="result-count"></span></div>
 <main id="results"></main>
-<footer>2025년 귀속 업종코드 · 국세청 기준경비율 자료 기반 · 생성일 __BUILD_DATE__</footer>
+<footer>더나은세무법인 덕수 · 김태현 세무사 · 2025년 귀속 업종코드 · 국세청 기준경비율 자료 기반 · 생성일 __BUILD_DATE__</footer>
 
 <script>
 const DATA = __DATA_JSON__;
