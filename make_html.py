@@ -307,6 +307,19 @@ mark{
   border-radius:2px;
 }
 #result-count{font-weight:600;color:var(--main);}
+#xlsxBtn{
+  margin-left:10px;
+  padding:4px 14px;
+  font-size:0.82rem;
+  font-weight:600;
+  border:1px solid var(--main);
+  border-radius:14px;
+  background:#fff;
+  color:var(--main);
+  cursor:pointer;
+  vertical-align:middle;
+}
+#xlsxBtn:hover{background:var(--main);color:#fff;}
 #empty-hint{color:var(--sub);padding:30px 0;text-align:center;}
 footer{
   text-align:center;
@@ -322,7 +335,7 @@ footer{
   <div class="brand">더나은세무법인 덕수 · 김태현 세무사</div>
   <input id="searchBox" type="text" placeholder="키워드 또는 업종코드 입력 — 예: 임가공, 무상사급, 921505" autocomplete="off">
 </header>
-<div id="meta"><span id="result-count"></span></div>
+<div id="meta"><span id="result-count"></span><button id="xlsxBtn" type="button" style="display:none;">&#8681; 엑셀 다운로드</button></div>
 <main id="results"></main>
 <footer>더나은세무법인 덕수 · 김태현 세무사 · 2025년 귀속 업종코드 · 국세청 기준경비율 자료 기반 · 생성일 __BUILD_DATE__</footer>
 
@@ -415,16 +428,234 @@ function renderCard(rec, keywords){
   </div>`;
 }
 
+// ---- 엑셀(xlsx) 다운로드: 외부 라이브러리 없이 순수 JS로 ZIP(xlsx)을 직접 조립 ----
+// (오프라인 단일 파일 원칙 유지 — CDN 의존 없음)
+
+function crc32(bytes){
+  if(!crc32.table){
+    const t = [];
+    for(let n=0;n<256;n++){
+      let c = n;
+      for(let k=0;k<8;k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[n] = c >>> 0;
+    }
+    crc32.table = t;
+  }
+  let crc = 0xFFFFFFFF;
+  for(let i=0;i<bytes.length;i++) crc = (crc >>> 8) ^ crc32.table[(crc ^ bytes[i]) & 0xFF];
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function dosDateTime(d){
+  const time = ((d.getHours()&0x1F)<<11) | ((d.getMinutes()&0x3F)<<5) | ((Math.floor(d.getSeconds()/2))&0x1F);
+  const date = (((d.getFullYear()-1980)&0x7F)<<9) | (((d.getMonth()+1)&0xF)<<5) | (d.getDate()&0x1F);
+  return {time, date};
+}
+
+function u16(n){ return [n & 0xFF, (n>>>8)&0xFF]; }
+function u32(n){ return [n&0xFF,(n>>>8)&0xFF,(n>>>16)&0xFF,(n>>>24)&0xFF]; }
+
+// files: [{name, data:Uint8Array}] -> zip(=xlsx) Blob (압축 없이 저장, ZIP STORE)
+function buildZip(files){
+  const enc = new TextEncoder();
+  const {time, date} = dosDateTime(new Date());
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  for(const f of files){
+    const nameBytes = enc.encode(f.name);
+    const data = f.data;
+    const crc = crc32(data);
+    const flags = 0x0800; // UTF-8 파일명
+    const lh = [].concat(
+      u32(0x04034b50), u16(20), u16(flags), u16(0), u16(time), u16(date),
+      u32(crc), u32(data.length), u32(data.length), u16(nameBytes.length), u16(0)
+    );
+    const localHeader = new Uint8Array(lh);
+    localParts.push(localHeader, nameBytes, data);
+
+    const ch = [].concat(
+      u32(0x02014b50), u16(20), u16(20), u16(flags), u16(0), u16(time), u16(date),
+      u32(crc), u32(data.length), u32(data.length), u16(nameBytes.length), u16(0), u16(0),
+      u16(0), u16(0), u32(0), u32(offset)
+    );
+    centralParts.push(new Uint8Array(ch), nameBytes);
+
+    offset += localHeader.length + nameBytes.length + data.length;
+  }
+  const centralStart = offset;
+  const centralSize = centralParts.reduce((s,p)=>s+p.length, 0);
+  const eocd = new Uint8Array([].concat(
+    u32(0x06054b50), u16(0), u16(0), u16(files.length), u16(files.length),
+    u32(centralSize), u32(centralStart), u16(0)
+  ));
+  return new Blob([...localParts, ...centralParts, eocd], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+}
+
+function escXml(s){
+  return String(s == null ? '' : s)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;');
+}
+
+function colLetter(idx){
+  let s = '', n = idx + 1;
+  while(n > 0){
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65+rem) + s;
+    n = Math.floor((n-1)/26);
+  }
+  return s;
+}
+
+// 기초DB형 컬럼 정의: 소스 데이터 구조 그대로 1코드 = 1행
+const XLSX_COLUMNS = [
+  {key:'code', header:'코드', width:10},
+  {key:'upTae', header:'대분류', width:14},
+  {key:'jung', header:'중분류', width:16},
+  {key:'se', header:'소분류', width:20},
+  {key:'sese', header:'세세분류', width:24},
+  {key:'gijun', header:'적용기준내용', width:50, wrap:true},
+  {key:'r1', header:'단순경비율(일반)', width:13, numeric:true},
+  {key:'r2', header:'단순경비율(초과)', width:13, numeric:true},
+  {key:'r3', header:'기준경비율', width:12, numeric:true},
+  {key:'ksicText', header:'연계 표준산업분류(KSIC)', width:45, wrap:true},
+];
+
+function buildSheetXml(records){
+  const cols = XLSX_COLUMNS;
+  const colsXml = '<cols>' + cols.map((c,i)=>`<col min="${i+1}" max="${i+1}" width="${c.width}" customWidth="1"/>`).join('') + '</cols>';
+  let rowsXml = '<row r="1">' + cols.map((c,i)=>
+    `<c r="${colLetter(i)}1" t="inlineStr" s="1"><is><t xml:space="preserve">${escXml(c.header)}</t></is></c>`
+  ).join('') + '</row>';
+  records.forEach((rec, rIdx) => {
+    const rowNum = rIdx + 2;
+    const cellsXml = cols.map((c,i) => {
+      const ref = colLetter(i) + rowNum;
+      if(c.numeric){
+        const raw = rec[c.key];
+        const num = parseFloat(raw);
+        if(raw === '' || raw == null || isNaN(num)) return `<c r="${ref}" s="4"/>`;
+        return `<c r="${ref}" s="4"><v>${num}</v></c>`;
+      }
+      const style = c.wrap ? 2 : 3;
+      return `<c r="${ref}" t="inlineStr" s="${style}"><is><t xml:space="preserve">${escXml(rec[c.key])}</t></is></c>`;
+    }).join('');
+    rowsXml += `<row r="${rowNum}">${cellsXml}</row>`;
+  });
+  const dim = `A1:${colLetter(cols.length-1)}${records.length+1}`;
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<dimension ref="${dim}"/>
+<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft" activeCell="A2" sqref="A2"/></sheetView></sheetViews>
+<sheetFormatPr defaultRowHeight="15"/>
+${colsXml}
+<sheetData>${rowsXml}</sheetData>
+<autoFilter ref="${dim}"/>
+</worksheet>`;
+}
+
+const XLSX_STYLES = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<numFmts count="1"><numFmt numFmtId="164" formatCode="0.0"/></numFmts>
+<fonts count="2">
+<font><sz val="10"/><name val="맑은 고딕"/></font>
+<font><sz val="10"/><b/><color rgb="FFFFFFFF"/><name val="맑은 고딕"/></font>
+</fonts>
+<fills count="3">
+<fill><patternFill patternType="none"/></fill>
+<fill><patternFill patternType="gray125"/></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FF00338D"/><bgColor indexed="64"/></patternFill></fill>
+</fills>
+<borders count="2">
+<border><left/><right/><top/><bottom/><diagonal/></border>
+<border><left style="thin"><color rgb="FFDDDDDD"/></left><right style="thin"><color rgb="FFDDDDDD"/></right><top style="thin"><color rgb="FFDDDDDD"/></top><bottom style="thin"><color rgb="FFDDDDDD"/></bottom><diagonal/></border>
+</borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="5">
+<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment vertical="top"/></xf>
+<xf numFmtId="164" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" horizontal="right"/></xf>
+</cellXfs>
+<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>`;
+
+const XLSX_CONTENT_TYPES = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>`;
+
+const XLSX_RELS_ROOT = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`;
+
+const XLSX_WORKBOOK = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="검색결과" sheetId="1" r:id="rId1"/></sheets>
+</workbook>`;
+
+const XLSX_WORKBOOK_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>`;
+
+function buildXlsxBlob(records){
+  const enc = new TextEncoder();
+  const files = [
+    {name:'[Content_Types].xml', data: enc.encode(XLSX_CONTENT_TYPES)},
+    {name:'_rels/.rels', data: enc.encode(XLSX_RELS_ROOT)},
+    {name:'xl/workbook.xml', data: enc.encode(XLSX_WORKBOOK)},
+    {name:'xl/_rels/workbook.xml.rels', data: enc.encode(XLSX_WORKBOOK_RELS)},
+    {name:'xl/styles.xml', data: enc.encode(XLSX_STYLES)},
+    {name:'xl/worksheets/sheet1.xml', data: enc.encode(buildSheetXml(records))},
+  ];
+  return buildZip(files);
+}
+
+function downloadXlsx(){
+  if(!lastAll.length) return;
+  const rows = lastAll.map(rec => Object.assign({}, rec, {
+    ksicText: rec.ksic.map(k => k.code + ' ' + k.name + (k.main ? '[메인]' : '') + (k.note ? '(' + k.note + ')' : '')).join('; ')
+  }));
+  const blob = buildXlsxBlob(rows);
+  const kw = lastQuery.replace(/[\\/:*?"<>|]/g, '_').slice(0, 30) || '검색결과';
+  const a = document.createElement('a');
+  const url = URL.createObjectURL(blob);
+  a.href = url;
+  a.download = `업종코드_${kw}_${rows.length}건.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+// ---- 엑셀 다운로드 끝 ----
+
 const searchBox = document.getElementById('searchBox');
 const resultsEl = document.getElementById('results');
 const countEl = document.getElementById('result-count');
+const xlsxBtn = document.getElementById('xlsxBtn');
+let lastAll = [];
+let lastQuery = '';
 let debounceTimer = null;
 
 function runSearch(){
   const raw = searchBox.value.trim();
+  lastQuery = raw;
   if(!raw){
     resultsEl.innerHTML = '<div id="empty-hint">검색어를 입력하세요.</div>';
     countEl.textContent = '';
+    lastAll = [];
+    xlsxBtn.style.display = 'none';
     return;
   }
   const keywords = raw.toLowerCase().split(/\s+/).filter(Boolean);
@@ -432,6 +663,8 @@ function runSearch(){
   const total = all.length;
   const shown = all.slice(0, MAX_RESULTS);
   countEl.textContent = total + '건';
+  lastAll = all;
+  xlsxBtn.style.display = total ? 'inline-block' : 'none';
   if(total === 0){
     resultsEl.innerHTML = '<div id="empty-hint">검색 결과가 없습니다.</div>';
     return;
@@ -453,6 +686,8 @@ searchBox.addEventListener('input', () => {
   clearTimeout(debounceTimer);
   debounceTimer = setTimeout(runSearch, 150);
 });
+
+xlsxBtn.addEventListener('click', downloadXlsx);
 
 runSearch();
 </script>
